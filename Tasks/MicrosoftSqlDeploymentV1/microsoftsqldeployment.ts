@@ -6,9 +6,9 @@ import SqlConnectionConfig from './src/SqlConnectionConfig';
 import SqlUtils from './src/SqlUtils';
 import FirewallManager from './src/FirewallManager';
 import AzureSqlResourceManager from './src/AzureSqlResourceManager';
-import { AzureRMEndpoint } from 'azure-pipelines-tasks-azure-arm-rest/azure-arm-endpoint';
-import { AzureEndpoint } from 'azure-pipelines-tasks-azure-arm-rest/azureModels';
 import SqlProjectBuilder from './src/SqlProjectBuilder';
+import { SqlPackageExecutor } from './src/SqlPackageExecutor';
+import { SqlcmdExecutor } from './src/SqlcmdExecutor';
 
 // Node version handling for DNS and network settings
 const nodeVersion = parseInt(process.version.split('.')[0].replace('v', ''));
@@ -25,18 +25,21 @@ if (nodeVersion > 19) {
 async function main(): Promise<void> {
     try {
         // Set resource path for localization
-        tl.setResourcePath(path.join(__dirname, 'task.json'));
+        tl.setResourcePath(path.join(__dirname, '..', 'task.json'));
 
-        console.log(tl.loc('StartingDeployment'));
+        tl.debug(tl.loc('StartingDeployment'));
 
         // Get required inputs per specification
         const action = tl.getInput('action', true)!;
-        const filePath = tl.getInput('path', true)!;
+        let filePath = tl.getInput('path', true)!;
         const connectionString = tl.getInput('connectionString', true)!;
+        
+        // Validate file path exists
+        tl.checkPath(filePath, 'path');
         
         // Mask connection string (contains sensitive data)
         tl.setSecret(connectionString);
-        console.log(tl.loc('ConnectionStringProvided'));
+        tl.debug(tl.loc('ConnectionStringProvided'));
 
         // Get optional inputs
         const azureSubscription = tl.getInput('azureSubscription', false);
@@ -59,7 +62,7 @@ async function main(): Promise<void> {
         }
 
         if (azureSubscription) {
-            console.log(tl.loc('UsingAzureSubscription', azureSubscription));
+            tl.debug(tl.loc('UsingAzureSubscription', azureSubscription));
         }
 
         if (firewallRuleManagement && !azureSubscription) {
@@ -79,10 +82,10 @@ async function main(): Promise<void> {
             throw new Error(tl.loc('InvalidFileExtension', fileExtension));
         }
 
-        console.log(tl.loc('ActionDetected', action, fileType));
+        tl.debug(tl.loc('ActionDetected', action, fileType));
 
         // Parse and validate connection string
-        console.log(tl.loc('ParsingConnectionString'));
+        tl.debug(tl.loc('ParsingConnectionString'));
         const connectionConfig = new SqlConnectionConfig(connectionString);
         tl.debug(`Parsed connection string - Server: ${connectionConfig.Server}, Database: ${connectionConfig.Database}`);
 
@@ -96,26 +99,102 @@ async function main(): Promise<void> {
             tl.debug(tl.loc('SqlPackageFound', sqlPackageExePath));
         }
 
-        // Discover sqlcmd for SQL script actions
+        // Discover sqlcmd for SQL script actions or firewall detection
         let sqlcmdExePath: string | undefined;
-        const needsSqlcmd = action === 'sqlScript' || (fileType === 'SQL' && action === 'script');
+        const needsSqlcmd = action === 'sqlScript' || (fileType === 'SQL' && action === 'script') || firewallRuleManagement;
         
         if (needsSqlcmd) {
             tl.debug(tl.loc('SettingUpSqlCmd'));
             sqlcmdExePath = await SqlcmdHelper.findSqlcmd(sqlcmdPath);
-            tl.debug(tl.loc('SqlCmdFound', sqlcmdExePath));
+            tl.debug(tl.loc('SqlcmdFound', sqlcmdExePath));
         }
 
-        // TODO: Implement deployment logic
-        // - SqlPackage discovery (dotnet tool → MSI → PATH)
-        // - sqlcmd discovery/auto-install
-        // - Firewall rule management (if enabled)
-        // - SQL project build (if .sqlproj)
-        // - SqlPackage or sqlcmd execution
-        // - Output variable setting
-        // - Firewall cleanup in finally block
+        // Firewall management and deployment execution
+        let firewallManager: FirewallManager | undefined;
+        
+        try {
+            // Step 1: Firewall rule management (if enabled)
+            if (firewallRuleManagement && azureSubscription) {
+                try {
+                    // Lazy-load Azure ARM libraries only when needed
+                    const { AzureRMEndpoint } = require('azure-pipelines-tasks-azure-arm-rest/azure-arm-endpoint');
+                    const { AzureEndpoint } = require('azure-pipelines-tasks-azure-arm-rest/azureModels');
+                    
+                    // Get Azure endpoint with credentials
+                    const azureEndpoint: typeof AzureEndpoint = await new AzureRMEndpoint(azureSubscription).getEndpoint();
+                    
+                    // Detect IP address by testing connectivity
+                    const ipAddress = await SqlUtils.detectIPAddress(connectionConfig, sqlcmdExePath!);
+                    
+                    // Add firewall rule only if IP address was detected (connection blocked)
+                    if (ipAddress) {
+                        const resourceManager = await AzureSqlResourceManager.getResourceManager(
+                            connectionConfig.Server,
+                            azureEndpoint
+                        );
+                        firewallManager = new FirewallManager(resourceManager);
+                        await firewallManager.addFirewallRule(ipAddress);
+                    }
+                } catch (error) {
+                    tl.warning(`Firewall rule management failed: ${error.message || error}`);
+                    throw error;
+                }
+            } else if (!firewallRuleManagement) {
+                tl.debug(tl.loc('FirewallManagementDisabled'));
+            }
 
-        console.log(tl.loc('DeploymentSuccessful'));
+            // Step 2: SQL project build (if .sqlproj)
+            if (fileType === 'SQLPROJ') {
+                tl.debug(tl.loc('DetectedSqlProject'));
+                const builtDacpacPath = await SqlProjectBuilder.buildProject(filePath, buildArguments);
+                // Update path to point to built .dacpac
+                filePath = builtDacpacPath;
+                fileType = 'DACPAC';
+                tl.debug(tl.loc('UpdatedPathToBuiltDacpac', filePath));
+            }
+
+            // Step 3: Execute deployment (SqlPackage or sqlcmd)
+            let outputFilePath: string | undefined;
+            
+            if (fileType === 'DACPAC' || (fileType === 'SQL' && action !== 'sqlScript')) {
+                // Execute with SqlPackage (for DACPAC or SQL with script/deployReport action)
+                tl.debug(tl.loc('ExecutingSqlPackage', action));
+                outputFilePath = await SqlPackageExecutor.executeSqlPackage(
+                    sqlPackageExePath!,
+                    action,
+                    filePath,
+                    connectionConfig,
+                    publishProfile,
+                    additionalArguments
+                );
+            } else if (fileType === 'SQL' && action === 'sqlScript') {
+                // Execute with sqlcmd (for SQL scripts)
+                tl.debug(tl.loc('ExecutingSqlScript', filePath));
+                await SqlcmdExecutor.executeSqlcmd(
+                    sqlcmdExePath!,
+                    filePath,
+                    connectionConfig,
+                    additionalArguments
+                );
+            }
+
+            // Step 4: Set output variables
+            if (outputFilePath) {
+                tl.debug(tl.loc('OutputFileGenerated', outputFilePath));
+                tl.setVariable('SqlDeploymentOutputFile', outputFilePath);
+            }
+
+            tl.debug(tl.loc('DeploymentSuccessful'));
+        } finally {
+            // Always cleanup firewall rule
+            if (firewallManager) {
+                try {
+                    await firewallManager.removeFirewallRule();
+                } catch (cleanupError) {
+                    tl.warning(`Failed to cleanup firewall rule: ${cleanupError.message || cleanupError}`);
+                }
+            }
+        }
     }
     catch (error) {
         tl.debug(`Deployment failed with error: ${error}`);
