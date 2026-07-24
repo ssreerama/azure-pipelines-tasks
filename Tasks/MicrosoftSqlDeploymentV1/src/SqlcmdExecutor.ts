@@ -20,7 +20,13 @@ export class SqlcmdExecutor {
             envVars['SQLCMDPASSWORD'] = connectionConfig.Password;
         }
         if (accessToken) {
-            envVars['SQLCMDACCESSTOKEN'] = accessToken;
+            // Only use access token for AAD token-based auth (Default/Integrated).
+            // For SQL auth and AAD Password/ServicePrincipal, credentials are in SQLCMDPASSWORD.
+            const tokenBasedAuthTypes = ['activedirectorydefault', 'activedirectoryintegrated'];
+            const authType = (connectionConfig.FormattedAuthentication ?? '').toLowerCase();
+            if (tokenBasedAuthTypes.includes(authType)) {
+                envVars['SQLCMDACCESSTOKEN'] = accessToken;
+            }
         }
 
         tl.debug(`Executing sqlcmd: ${sqlcmdPath}`);

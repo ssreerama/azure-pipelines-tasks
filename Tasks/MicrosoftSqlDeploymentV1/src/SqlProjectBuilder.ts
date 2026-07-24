@@ -66,25 +66,23 @@ export default class SqlProjectBuilder {
     }
 
     /**
-     * Finds an argument value from a command line string
-     * Supports both longForm (--output) and shortForm (-o)
+     * Finds an argument value from a command line string.
+     * Tokenizes using parseArguments to avoid substring false-positives
+     * (e.g. --output matching inside --output-path).
      */
     private static findArgument(args: string, longForm: string, shortForm: string): string | undefined {
-        // Match patterns like: --output "path" or -o path or --output=path
-        const patterns = [
-            new RegExp(`${longForm}[\\s=]+"([^"]+)"`, 'i'),  // --output "path"
-            new RegExp(`${longForm}[\\s=]+([^\\s]+)`, 'i'),   // --output path or --output=path
-            new RegExp(`${shortForm}[\\s]+"([^"]+)"`, 'i'),   // -o "path"
-            new RegExp(`${shortForm}[\\s]+([^\\s]+)`, 'i')    // -o path
-        ];
-
-        for (const pattern of patterns) {
-            const match = args.match(pattern);
-            if (match && match[1]) {
-                return match[1].trim();
+        const tokens = this.parseArguments(args);
+        for (let i = 0; i < tokens.length - 1; i++) {
+            const token = tokens[i];
+            // --flag value or -f value
+            if (token === longForm || token === shortForm) {
+                return tokens[i + 1];
+            }
+            // --flag=value
+            if (token.startsWith(`${longForm}=`)) {
+                return token.slice(longForm.length + 1);
             }
         }
-
         return undefined;
     }
 

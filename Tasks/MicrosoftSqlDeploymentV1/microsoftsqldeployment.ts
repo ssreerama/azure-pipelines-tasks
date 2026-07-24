@@ -196,6 +196,9 @@ async function main(): Promise<void> {
                     tl.setVariable('SqlDeploymentOutputFile', outputFilePath);
                 }
             } else if (deployFileType === 'SQL') {
+                if (action.toLowerCase() !== 'sqlscript') {
+                    throw new Error(tl.loc('InvalidAction', action));
+                }
                 tl.debug(tl.loc('ExecutingSqlScript', deployFilePath));
                 await SqlcmdExecutor.executeSqlcmd(
                     sqlcmdExePath!,
